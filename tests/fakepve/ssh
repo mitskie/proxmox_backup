@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Фальшивый ssh-клиент для тестов proxmox_backup.py.
+
+Эмулирует команды ноды Proxmox: qm list, pct list, pvesm status/list/path,
+vzdump, sha256sum, rm, mkdir, tar, cat /etc/pve/*, proxmox-backup-client,
+создание временного файла пароля PBS (umask 077; mktemp...), проверку
+ключа шифрования (if [ ! -e ... ] -> PVEKEY:...) и составную команду
+очистки временных файлов PBS (rm -rf ...; echo PVECLNRC:$?; ...).
+Файлы «ноды» хранятся в каталоге $FAKE_PVE_DIR. Создаваемые «архивы» имеют
+корректные сигнатуры форматов vzdump (VMA / tar / gzip / zstd / lzop), чтобы
+проходить проверку структуры.
+
+Режимы (переменные окружения):
+  FAKE_SSH_PASSWORD=1   — запрашивает пароль как настоящий ssh
+  FAKE_SSH_WRONGPASS=1  — пароль «неверный»: повторный запрос пароля
+  FAKE_SSH_FAIL=1       — эмуляция недоступной ноды (код 255)
+  FAKE_NO_PCT=1         — утилита pct на ноде отсутствует
+  FAKE_VZDUMP_FAIL=1    — vzdump завершается ошибкой
+  FAKE_BAD_ARCHIVE=1    — vzdump создаёт «архив» без корректной сигнатуры
+  FAKE_RM_FAIL=1        — rm на ноде завершается ошибкой (файлы не удаляются)
+  FAKE_TS=2026_01_01-00_00_00 — фиксированная метка времени в имени архива
+  FAKE_PVESM_LIST_FAIL=1 — pvesm list завершается ошибкой
+  FAKE_PVESM_STATUS_MESSY=1 — pvesm status без заголовка и с мусорной строкой
+  FAKE_PVESM_STATUS_NOAVAIL=1 — заголовок pvesm status без столбца Available
+  FAKE_PBS_ROW=1        — в вывод pvesm list добавляется строка PBS-хранилища
+  FAKE_PBS_STORAGE=1    — на ноде есть PBS-хранилище pbs1 (pvesm status/list)
+  FAKE_NO_PBS_CLIENT=1  — на ноде нет proxmox-backup-client
+  FAKE_NO_PBS_PW=1      — нет источника пароля PBS (PVEPBSNOPW)
+  FAKE_PBS_MKTEMP_FAIL=1 — mktemp на ноде не может создать файл пароля
+  FAKE_PBS_RESTORE_FAIL=1 — proxmox-backup-client restore завершается ошибкой
+  FAKE_TAR_FAIL=1       — tar на ноде завершается ошибкой
+  FAKE_PBS_NEEDS_KEY=1  — снапшоты PBS зашифрованы: restore без --keyfile падает
+  FAKE_KEY_UNREADABLE=1 — файл ключа /etc/pve/priv/storage/pbs1.enc не читается
+Состояния файла ключа для остальных случаев (отсутствует / не обычный файл /
+пуст) задаются самим содержимым каталога «ноды» (FAKE_PVE_DIR/priv/storage/).
+"""
+import gzip
+import hashlib
+import io
+import json
+import os
+import re
+import shlex
+import shutil
+import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+
+NODE = Path(os.environ.get("FAKE_PVE_DIR", "/tmp/fakepve"))
+DUMP = NODE / "dump"
+
+VMA_MAGIC = b"VMA\x00"
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+LZO_MAGIC = b"\x89LZO\x00\r\n\x1a\n"
+
+
+def node_path(path):
+    """Отображение виртуальных путей /etc/pve/* в каталог «ноды»."""
+    if path == "/etc/pve/storage.cfg":
+        return NODE / "storage.cfg"
+    if path.startswith("/etc/pve/priv/storage/"):
+        return NODE / "priv" / "storage" / Path(path).name
+    return Path(path)
+
+
+def ask_password():
+    """Имитация запроса пароля: prompt -> чтение строки -> (неверный?) повтор."""
+    sys.stderr.write("root@fakepve's password: ")
+    sys.stderr.flush()
+    sys.stdin.readline()
+    if os.environ.get("FAKE_SSH_WRONGPASS") == "1":
+        sys.stderr.write("\nPermission denied, please try again.\n")
+        sys.stderr.write("root@fakepve's password: ")
+        sys.stderr.flush()
+        sys.stdin.readline()          # скрипт должен прервать нас с AuthError
+
+
+def make_tar_bytes():
+    """Настоящий tar-образ в памяти (для .tar / .tar.gz контейнеров)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        data = b"fake container root\n"
+        info = tarfile.TarInfo("etc/hostname")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def archive_payload(prefix, compress):
+    """Байты «архива» с корректной сигнатурой (проверяется скриптом)."""
+    tar = make_tar_bytes()
+    if compress == "zstd":
+        inner = tar if prefix == "lxc" else b"vma-body"
+        return ZSTD_MAGIC + b"payload:" + inner
+    if compress == "gzip":
+        inner = tar if prefix == "lxc" else VMA_MAGIC + b"vma-body"
+        return gzip.compress(inner)
+    if compress == "lzo":
+        inner = tar if prefix == "lxc" else b"vma-body"
+        return LZO_MAGIC + b"payload:" + inner
+    return tar if prefix == "lxc" else VMA_MAGIC + b"vma-body"
+
+
+def cmd_vzdump(args_str):
+    vmid = args_str.split()[0]
+    if os.environ.get("FAKE_VZDUMP_FAIL") == "1":
+        print(f"ERROR: Backup of VM/CT {vmid} failed - fake failure")
+        print("kvm: ... task aborted")
+        return 1
+    m = re.search(r"--compress\s+(\S+)", args_str)
+    compress = m.group(1) if m else "zstd"
+    DUMP.mkdir(parents=True, exist_ok=True)
+    prefix = "lxc" if vmid.isdigit() and int(vmid) >= 200 else "qemu"
+    ext = {"zstd": ".zst", "gzip": ".gz", "lzo": ".lzo", "none": ""}[compress]
+    kind = "tar" if prefix == "lxc" else "vma"
+    name = ""
+    for _ in range(6):
+        ts = os.environ.get("FAKE_TS") or time.strftime("%Y_%m_%d-%H_%M_%S")
+        base = f"vzdump-{prefix}-{vmid}-{ts}"
+        name = f"{base}.{kind}{ext}"
+        if not (DUMP / name).exists() or os.environ.get("FAKE_TS"):
+            break
+        time.sleep(1)
+    (DUMP / name).write_bytes(archive_payload(prefix, compress))
+    (DUMP / f"{base}.log").write_text("fake vzdump log\n")
+    (DUMP / f"{name}.notes").write_text("fake notes\n")
+    if os.environ.get("FAKE_BAD_ARCHIVE") == "1":
+        (DUMP / name).write_bytes(b"GARBAGE NOT AN ARCHIVE\x00\x01\x02" * 100)
+    print(f"INFO: creating vzdump archive '{DUMP / name}'")
+    print("INFO: Backup finished at", ts)
+    return 0
+
+
+def pbs_manifest(snapshot):
+    """Манифест снапшота PBS в формате proxmox-backup-client."""
+    parts = snapshot.split("/")
+    btype = parts[0] if parts else "vm"
+    bid = parts[1] if len(parts) > 1 else "?"
+    if btype == "ct":
+        files = [{"filename": "pct.conf.blob", "size": 211},
+                 {"filename": "root.pxar.didx", "size": 4096}]
+    else:
+        files = [{"filename": "qemu-server.conf.blob", "size": 288},
+                 {"filename": "drive-scsi0.img.fidx", "size": 34603008}]
+    return {"backup-type": btype, "backup-id": bid,
+            "backup-time": 1735000000, "files": files}
+
+
+def cmd_pbs_client(args_str, remote_cmd):
+    """Эмуляция proxmox-backup-client restore <snap> <archive> <target|->.
+
+    Опции: --keyfile <файл> (шифрование). Каждый вызов пишется в
+    pbs-client-calls.log «ноды» для проверок тестами.
+    """
+    NODE.mkdir(parents=True, exist_ok=True)
+    with open(NODE / "pbs-client-calls.log", "a", encoding="utf-8") as fh:
+        fh.write(remote_cmd + "\n")
+    tokens = shlex.split(args_str)
+    keyfile, positionals, i = None, [], 0
+    while i < len(tokens):
+        if tokens[i] == "--keyfile" and i + 1 < len(tokens):
+            keyfile = tokens[i + 1]
+            i += 2
+            continue
+        positionals.append(tokens[i])
+        i += 1
+    if len(positionals) < 2 or positionals[0] != "restore":
+        sys.stderr.write("fake-pbs-client: поддерживается только "
+                         "restore <snapshot> <archive> <target>\n")
+        return 1
+    if os.environ.get("FAKE_PBS_RESTORE_FAIL") == "1":
+        sys.stderr.write("proxmox-backup-client: fake restore failure\n")
+        return 1
+    snapshot, archive = positionals[1], positionals[2]
+    target = positionals[3] if len(positionals) > 3 else "-"
+    if keyfile:
+        kf = node_path(keyfile)
+        if not kf.is_file() or kf.read_bytes().startswith(b"CORRUPT"):
+            sys.stderr.write("proxmox-backup-client: unable to load encryption "
+                             "key (fake)\n")
+            return 1
+    if (os.environ.get("FAKE_PBS_NEEDS_KEY") == "1" and not keyfile
+            and archive != "index.json"):
+        sys.stderr.write("proxmox-backup-client: unable to decrypt — "
+                         "encryption key required (fake)\n")
+        return 1
+    if archive == "index.json" and target == "-":
+        print(json.dumps(pbs_manifest(snapshot)))
+        return 0
+    if target == "-":
+        sys.stderr.write("fake-pbs-client: stdout restore not supported\n")
+        return 1
+    path = Path(target)
+    if re.search(r"\.pxar(\.didx)?$", archive):
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "extracted-file.txt").write_text("fake pxar content\n")
+        return 0
+    if archive.endswith(".fidx"):
+        path.write_bytes(b"PBS-RESTORED-IMAGE\n" * 32)
+        return 0
+    path.write_text(f"fake config of {snapshot}\n")
+    return 0
+
+
+def cmd_pvesm_list(storage):
+    if storage == "pbs1":
+        if os.environ.get("FAKE_PBS_STORAGE") == "1":
+            print("Volid  Format  Type  Size  Filename")
+            print("pbs1:backup/ct/200/2025-12-30T22:00:00Z  pbs-ct  backup  2048  -")
+            print("pbs1:backup/vm/105/2025-12-31T22:00:00Z  pbs-vm  backup  4096  -")
+            print("pbs1:backup/vm/105/2026-01-01T22:00:00Z  pbs-vm  backup  5120  -")
+        return 0
+    exts = (".vma.zst", ".vma.gz", ".vma.lzo", ".vma",
+            ".tar.zst", ".tar.gz", ".tar.lzo", ".tar")
+    print("Volid  Format  Type  Size  Filename")
+    if DUMP.is_dir():
+        for f in sorted(DUMP.iterdir()):
+            if f.is_file() and f.name.endswith(exts):
+                print(f"{storage}:backup/{f.name}  vzdump  qemu"
+                      f"  {f.stat().st_size}  {DUMP / f.name}")
+    if os.environ.get("FAKE_PBS_ROW") == "1":
+        print("pbs:backup/vm/105/2025-12-31T22:00:00Z pbs1 backup 4096 -")
+    return 0
+
+
+def cmd_pvesm_path(volid):
+    if volid.startswith("pbs"):
+        sys.stderr.write("pvesm: error: volume is on a PBS storage "
+                         "(no filesystem path)\n")
+        return 1
+    name = volid.split(":backup/", 1)[-1]
+    f = DUMP / name
+    if f.is_file():
+        print(f)
+        return 0
+    sys.stderr.write(f"pvesm: volume '{volid}' not found (fake)\n")
+    return 1
+
+
+def cmd_cat(path):
+    if path == "/etc/pve/storage.cfg":
+        f = NODE / "storage.cfg"
+        if f.is_file():
+            print(f.read_text())
+            return 0
+        sys.stderr.write("cat: /etc/pve/storage.cfg: No such file or directory\n")
+        return 1
+    if path.startswith("/etc/pve/priv/storage/") and path.endswith(".pw"):
+        if os.environ.get("FAKE_NO_PBS_PW") == "1":
+            sys.stderr.write(f"cat: {path}: No such file or directory\n")
+            return 1
+        print("fake-pbs-password")
+        return 0
+    sys.stderr.write(f"cat: {path}: No such file or directory\n")
+    return 1
+
+
+def cmd_tar(tokens):
+    """tar -C <dir> -cf <out> ."""
+    if os.environ.get("FAKE_TAR_FAIL") == "1":
+        sys.stderr.write("tar: fake write error: Cannot allocate memory\n")
+        return 1
+    try:
+        src = Path(tokens[tokens.index("-C") + 1])
+        out = tokens[tokens.index("-cf") + 1]
+    except (ValueError, IndexError):
+        sys.stderr.write("fake-tar: unsupported args\n")
+        return 1
+    with tarfile.open(out, "w") as tf:
+        for p in sorted(src.rglob("*")):
+            if p.is_file():
+                tf.add(p, arcname=str(p.relative_to(src)))
+    return 0
+
+
+def cmd_rm(tokens):
+    if os.environ.get("FAKE_RM_FAIL") == "1":
+        sys.stderr.write("rm: cannot remove 'archive': "
+                         "Read-only file system (fake)\n")
+        return 1
+    paths = tokens[tokens.index("--") + 1:] if "--" in tokens else tokens[1:]
+    for token in paths:
+        if token.startswith("-"):
+            continue
+        p = Path(token)
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            p.unlink(missing_ok=True)
+    return 0
+
+
+def cmd_pbs_pw_prepare(remote_cmd):
+    """Эмуляция node-side создания временного файла с паролем PBS.
+
+    Источники — как в реальной команде: строка password в блоке pbs в
+    storage.cfg, затем /etc/pve/priv/storage/<имя>.pw (виртуальный файл
+    NODE/priv/storage/<имя>.pw; при FAKE_NO_PBS_PW считается, что его нет).
+    Файл создаётся по-настоящему (mktemp в /dev/shm или /tmp, права 600),
+    чтобы тесты могли проверить и использование, и последующую уборку.
+    """
+    match = re.search(r"awk -v S=(\S+) '", remote_cmd)
+    storage = match.group(1) if match else ""
+    value = ""
+    cfg = NODE / "storage.cfg"
+    if cfg.is_file():
+        in_block = False
+        for line in cfg.read_text(encoding="utf-8").splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if not line[0].isspace():
+                head = line.split(":", 1)
+                in_block = (len(head) == 2 and head[0].strip() == "pbs"
+                            and head[1].strip() == storage)
+                continue
+            if in_block:
+                key, _, val = line.strip().partition(" ")
+                if key.strip() == "password":
+                    value = val.strip()
+                    break
+    if not value and os.environ.get("FAKE_NO_PBS_PW") != "1":
+        pwf = NODE / "priv" / "storage" / f"{storage}.pw"
+        if pwf.is_file() and pwf.stat().st_size > 0:
+            lines = [l for l in pwf.read_text(encoding="utf-8").splitlines()
+                     if l.strip()]
+            value = lines[-1] if lines else ""
+        else:
+            value = "fake-pbs-password"   # как раньше отдавал fake cat .pw
+    if not value:
+        print("PVEPBSNOPW")
+        return 0
+    if os.environ.get("FAKE_PBS_MKTEMP_FAIL") == "1":
+        print("PVEPBSERR:mktemp")
+        return 0
+    tmp_dir = ("/dev/shm" if os.path.isdir("/dev/shm")
+               and os.access("/dev/shm", os.W_OK) else "/tmp")
+    fd, path = tempfile.mkstemp(prefix="pbs-pw.", dir=tmp_dir)
+    os.write(fd, value.encode("utf-8"))
+    os.close(fd)
+    os.chmod(path, 0o600)
+    print(path)
+    return 0
+
+
+def cmd_pbs_key_check(remote_cmd):
+    """Эмуляция проверки файла ключа шифрования PBS.
+
+    Скрипт присылает команду вида:
+      if [ ! -e '<путь>' ]; then echo PVEKEY:missing; elif [ ! -f '<путь>' ] ...
+    Ответ — фактическое состояние виртуального файла «ноды»:
+    missing / notfile / noread / empty / ok.
+    """
+    tokens = shlex.split(remote_cmd)
+    try:
+        path = tokens[tokens.index("-e") + 1]
+    except (ValueError, IndexError):
+        sys.stderr.write("fake-ssh: не удалось разобрать проверку ключа\n")
+        return 1
+    if os.environ.get("FAKE_KEY_UNREADABLE") == "1" and path.endswith(".enc"):
+        print("PVEKEY:noread")
+        return 0
+    p = node_path(path)
+    if not p.exists() and not p.is_symlink():
+        print("PVEKEY:missing")
+    elif not p.is_file():
+        print("PVEKEY:notfile")          # каталог, сокет и т.п.
+    else:
+        try:
+            with open(p, "rb") as fh:
+                empty = not fh.read(1)
+        except OSError:
+            print("PVEKEY:noread")
+            return 0
+        print("PVEKEY:empty" if empty else "PVEKEY:ok")
+    return 0
+
+
+def cmd_pbs_cleanup(remote_cmd):
+    """Эмуляция составной команды очистки PBS:
+
+      rm -rf -- <пути> 2>/dev/null; echo PVECLNRC:$?; for p in <пути>; do
+      if [ -e "$p" ] || [ -L "$p" ]; then echo PVELEFT:$p; fi; done
+
+    Выполняет rm по-настоящему (учитывая FAKE_RM_FAIL) и печатает маркеры
+    подтверждения: PVECLNRC:<код> и PVELEFT:<путь> для всего оставшегося.
+    """
+    m = re.match(
+        r"^rm -rf -- (?P<targets>.+?) 2>/dev/null; echo PVECLNRC:\$\?; "
+        r"for p in (?P<loop>.+?); do if \[ -e \"\$p\" \] \|\| "
+        r"\[ -L \"\$p\" \]; then echo PVELEFT:\$p; fi; done$",
+        remote_cmd)
+    if not m:
+        sys.stderr.write("fake-ssh: не удалось разобрать команду очистки PBS\n")
+        return 1
+    paths = shlex.split(m.group("targets"))
+    loop = shlex.split(m.group("loop"))
+    if loop != paths:
+        sys.stderr.write("fake-ssh: списки путей в команде очистки различаются\n")
+        return 1
+    rc = cmd_rm(["rm", "-rf", "--"] + paths)
+    print(f"PVECLNRC:{rc}")
+    for path in paths:
+        p = Path(path)
+        if p.exists() or p.is_symlink():
+            print(f"PVELEFT:{path}")
+    return 0
+
+
+def main():
+    if os.environ.get("FAKE_SSH_FAIL") == "1":
+        sys.stderr.write("ssh: connect to host fakepve port 22: Connection refused\n")
+        return 255
+    args = sys.argv[1:]
+    # аргумент назначения: ровно user@host или user@host:порт (одна @);
+    # значения env-префикса (PBS_REPOSITORY='u@r@host:store') не подходят
+    idx = max(i for i, a in enumerate(args)
+              if re.match(r"^[^@\s]+@[^@\s:]+(:\d+)?$", a))
+    remote_cmd = " ".join(args[idx + 1:]).strip()
+    if os.environ.get("FAKE_SSH_PASSWORD") == "1":
+        ask_password()
+
+    if remote_cmd == "true":
+        return 0
+    if remote_cmd.startswith("command -v"):
+        tool = remote_cmd.split()[-1]
+        if tool == "pct" and os.environ.get("FAKE_NO_PCT") == "1":
+            sys.stderr.write("bash: command: pct: command not found\n")
+            return 1
+        if tool == "proxmox-backup-client" and \
+                os.environ.get("FAKE_NO_PBS_CLIENT") == "1":
+            sys.stderr.write("bash: command: proxmox-backup-client: "
+                             "command not found\n")
+            return 1
+        print(f"/usr/bin/fake-{tool}")
+        return 0
+    m = re.search(r"(?:^| )proxmox-backup-client (.+)$", remote_cmd)
+    if m:
+        return cmd_pbs_client(m.group(1), remote_cmd)
+    if remote_cmd.startswith("umask 077;"):
+        return cmd_pbs_pw_prepare(remote_cmd)
+    if remote_cmd.startswith("if [ ! -e ") and "PVEKEY:" in remote_cmd:
+        return cmd_pbs_key_check(remote_cmd)
+    if remote_cmd.startswith("rm -rf --") and "PVECLNRC" in remote_cmd:
+        return cmd_pbs_cleanup(remote_cmd)
+    if remote_cmd.startswith("qm list"):
+        print("VMID NAME                 STATUS     MEM(MB) BOOTDISK(GB) PID")
+        print(" 100 web01                running       2048        32.00 1000")
+        print(" 101 db01                 stopped       4096        64.00 0")
+        print(" 102 win10                running       8192        64.00 1002")
+        return 0
+    if remote_cmd.startswith("pct list"):
+        print("VMID Status     Lock         Name")
+        print("200  running                 ct-web")
+        print("201  stopped    backup      ct-db")
+        print("202  running    -           multi word ct")
+        return 0
+    if remote_cmd.startswith("pvesm list"):
+        if os.environ.get("FAKE_PVESM_LIST_FAIL") == "1":
+            sys.stderr.write("pvesm: error while listing storage (fake)\n")
+            return 1
+        tokens = shlex.split(remote_cmd)          # эмуляция shell-парсинга
+        return cmd_pvesm_list(tokens[2] if len(tokens) > 2 else "local")
+    if remote_cmd.startswith("pvesm path"):
+        tokens = shlex.split(remote_cmd)
+        return cmd_pvesm_path(tokens[2] if len(tokens) > 2 else "")
+    if remote_cmd.startswith("pvesm status"):
+        if os.environ.get("FAKE_PVESM_STATUS_NOAVAIL") == "1":
+            # Заголовок есть, но столбца Available в нём нет
+            print("Name             Type     Status           Total"
+                  "            Used       %")
+            print("local            dir      active       1000000000"
+                  "       500000000   50.00%")
+            print("local-lvm        lvmthin  active       1000000000"
+                  "       100000000   10.00%")
+            if os.environ.get("FAKE_PBS_STORAGE") == "1":
+                print("pbs1             pbs      active       2000000000"
+                      "       1000000000  50.00%")
+            return 0
+        if os.environ.get("FAKE_PVESM_STATUS_MESSY") == "1":
+            # Нестандартный вывод: без заголовка, с мусорной строкой
+            print("local            dir      active       1000000000       500000000"
+                  "       500000000       50.00%")
+            print("local-lvm        lvmthin  active       1000000000       100000000"
+                  "       900000000       10.00%")
+            print("broken-garbage-row")
+            if os.environ.get("FAKE_PBS_STORAGE") == "1":
+                print("pbs1             pbs      active       2000000000      "
+                      "1000000000      1000000000      50.00%")
+            return 0
+        print("Name             Type     Status           Total            Used"
+              "       Available        %")
+        print("local            dir      active       1000000000       500000000"
+              "       500000000       50.00%")
+        print("local-lvm        lvmthin  active       1000000000       100000000"
+              "       900000000       10.00%")
+        if os.environ.get("FAKE_PBS_STORAGE") == "1":
+            print("pbs1             pbs      active       2000000000      "
+                  "1000000000      1000000000      50.00%")
+        return 0
+    if remote_cmd.startswith("vzdump "):
+        return cmd_vzdump(remote_cmd[len("vzdump "):])
+    if re.match(r"^sha256sum -- ", remote_cmd):
+        tokens = shlex.split(remote_cmd)          # эмуляция shell-парсинга
+        path = Path(tokens[-1])
+        if not path.is_file():
+            print(f"sha256sum: {path}: No such file or directory", file=sys.stderr)
+            return 1
+        print(hashlib.sha256(path.read_bytes()).hexdigest(), " ", path)
+        return 0
+    if remote_cmd.startswith("cat "):
+        return cmd_cat(shlex.split(remote_cmd)[1])
+    if remote_cmd.startswith("mkdir "):
+        for token in shlex.split(remote_cmd)[1:]:
+            if token in ("-p", "--"):
+                continue
+            Path(token).mkdir(parents=True, exist_ok=True)
+        return 0
+    if remote_cmd.startswith("tar "):
+        return cmd_tar(shlex.split(remote_cmd))
+    if remote_cmd.startswith("rm "):
+        return cmd_rm(shlex.split(remote_cmd))
+    print(f"fake-ssh: неизвестная команда: {remote_cmd}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

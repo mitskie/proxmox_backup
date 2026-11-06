@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Фальшивый scp для тестов proxmox_backup.py.
+
+Копирует «удалённый» файл из $FAKE_PVE_DIR локально.
+
+Режимы:
+  FAKE_SSH_PASSWORD=1   — запрашивает пароль как настоящий scp
+  FAKE_SSH_FAIL=1       — эмуляция недоступной ноды (код 255)
+  FAKE_SCP_FAIL=1       — ошибка передачи после аутентификации
+  FAKE_CORRUPT=1        — намеренно повреждает первый байт копии
+"""
+import os
+import shutil
+import sys
+from pathlib import Path
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        return 1
+    if os.environ.get("FAKE_SSH_FAIL") == "1":
+        sys.stderr.write("ssh: connect to host fakepve port 22: Connection refused\n")
+        return 255
+    src, dst = None, args[-1]
+    for arg in args:
+        if ":" in arg and "@" in arg and not arg.startswith("-"):
+            src = arg.split(":", 1)[1]
+    if src is None:
+        print("fake-scp: не найден источник user@host:path", file=sys.stderr)
+        return 1
+    if os.environ.get("FAKE_SCP_FAIL") == "1":
+        sys.stderr.write("scp: fake network failure during transfer\n")
+        return 1
+    if os.environ.get("FAKE_SSH_PASSWORD") == "1":
+        sys.stderr.write("root@fakepve's password: ")
+        sys.stderr.flush()
+        sys.stdin.readline()
+    if os.environ.get("FAKE_CORRUPT") == "1":
+        data = bytearray(Path(src).read_bytes())
+        data[0] ^= 0xFF
+        Path(dst).write_bytes(bytes(data))
+    else:
+        shutil.copyfile(src, dst)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
